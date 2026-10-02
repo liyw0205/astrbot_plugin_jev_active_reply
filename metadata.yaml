@@ -1,0 +1,9 @@
+name: astrbot_plugin_jev_active_reply
+display_name: Jev主动回复插件
+desc: 自动读取当前人设与群聊场景，支持 TypeSafe 和 MindsHub 独立多 Key 轮询、自然续聊、沉默与可选二次审查。
+version: 0.2.1
+author: 木有知
+repo: https://github.com/muyouzhi6/astrbot_plugin_jev_active_reply
+astrbot_version: ">=4.28.2,<5"
+support_platforms:
+  - aiocqhttp
