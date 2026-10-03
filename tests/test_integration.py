@@ -77,8 +77,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             "debounce_seconds": 0,
             "strict_conflicts": True,
             "second_review": "off",
+            "image_decision_mode": "native_vision",
             "burst_merge_enabled": False,
-            "mindshub": {"keys": ["test-secret"]},
+            "nanbei": {"keys": ["test-secret"]},
         }
         with patch(
             "astrbot_plugin_jev_active_reply.main.StarTools.get_data_dir",
@@ -89,7 +90,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             "values": dict(
                 addressed=0.85, continuation=0.7, worthwhile=0.9, intrusive=0.1
             ),
-            "channel": "mindshub",
+            "channel": "nanbei",
             "model": "jev-1.13.0",
             "key_id": "masked",
         }
@@ -332,7 +333,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         cfg = AstrBotConfig(str(Path(self.tmp.name) / "config.json"), schema=schema)
-        self.assertEqual(cfg["mindshub"]["keys"], [])
+        self.assertEqual(cfg["nanbei"]["keys"], [])
         self.assertEqual(cfg["typesafe"]["keys"], [])
 
     async def test_voice_cache_only_not_reawakened(self):

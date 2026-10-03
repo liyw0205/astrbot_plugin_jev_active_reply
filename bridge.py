@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections import Counter
 
 from .policy import pack_state
 
@@ -33,8 +34,6 @@ def instance(context, event, name):
 def conflicts(context, event):
     found = []
     for name in ("astrbot_plugin_jev_gate", "astrbot_plugin_wakepro"):
-        if name.endswith("wakepro") and event.get_extra("_jev_managed_wakepro"):
-            continue
         plugin = instance(context, event, name)
         if plugin is None:
             continue
@@ -65,6 +64,24 @@ def conflicts(context, event):
     ):
         found.append("astrbot_builtin_active_reply")
     return found
+
+
+def native_busy(event):
+    """Do not feed a separately admitted turn into Core's active follow-up."""
+    from astrbot.core.pipeline.process_stage import follow_up
+
+    runner = follow_up._ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
+    if runner is None or runner.done():
+        return False
+    owner = getattr(
+        getattr(getattr(runner, "run_context", None), "context", None), "event", None
+    )
+    return bool(
+        owner is not None
+        and owner is not event
+        and not owner.get_extra("agent_stop_requested")
+        and not owner.is_stopped()
+    )
 
 
 def fingerprint(conversation):
@@ -104,19 +121,32 @@ async def build_snapshot(context, event, room, target, config):
     ca = instance(context, event, "astrbot_plugin_context_aware")
     window = max(4, min(100, int(config.get("context_message_limit", 40))))
     used_ca = False
+    ca_status = "not_enabled"
     if ca and callable(getattr(ca, "get_recent_messages", None)):
         try:
             records = ca.get_recent_messages(event.unified_msg_origin, count=window)
+            ca_status = "empty"
             if isinstance(records, list) and records:
                 native_rows = rows
                 rows = [dict(r) for r in records if isinstance(r, dict)]
+
+                def identity(r):
+                    return (
+                        r.get("content"),
+                        r.get("sender_name"),
+                        bool(r.get("is_bot")),
+                    )
+
+                native_counts = Counter(identity(r) for r in native_rows)
+                public_counts = Counter(identity(r) for r in rows)
                 for record in rows:
                     match = next(
                         (
                             r
                             for r in reversed(native_rows)
-                            if r.get("content") == record.get("content")
-                            and r.get("sender_name") == record.get("sender_name")
+                            if identity(r) == identity(record)
+                            and native_counts[identity(r)] == 1
+                            and public_counts[identity(r)] == 1
                         ),
                         None,
                     )
@@ -129,8 +159,9 @@ async def build_snapshot(context, event, room, target, config):
                             }
                         )
                 used_ca = bool(rows)
+                ca_status = "available"
         except Exception:
-            pass  # Local ring remains available, never call a private store.
+            ca_status = "unavailable"  # Never call a private store to recover.
     if not used_ca and conv:
         try:
             history = getattr(conv, "history", [])
@@ -202,6 +233,7 @@ async def build_snapshot(context, event, room, target, config):
         if room.last_sent
         else None,
         "history_source": "context_aware" if used_ca else "native_history_and_local",
+        "context_aware_status": ca_status,
         "generation": room.generation,
     }
     if room.cid and cid != room.cid:

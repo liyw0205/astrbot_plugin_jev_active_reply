@@ -14,7 +14,7 @@ from astrbot.api.message_components import Image, Plain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from ..client import Adapter, JevClient, KeyPool
-from ..delivery import DeliveryDeclined, SplitAdapters, WakeAdapters
+from ..delivery import DeliveryDeclined, SplitAdapters
 from ..main import MARK
 from ..policy import QUESTIONS, is_refusal, pack_state, questions_for
 from ..state import Ledger
@@ -51,7 +51,7 @@ async def test_failed_quota_write_never_reserves_a_slot():
         def bump(self, *args):
             raise sqlite3.OperationalError("locked")
 
-    pool = KeyPool("mindshub", {"keys": ["fake-a", "fake-b"]})
+    pool = KeyPool("nanbei", {"keys": ["fake-a", "fake-b"]})
     pool.ledger = LedgerFailure()
     for _ in range(4):
         with pytest.raises(sqlite3.OperationalError):
@@ -272,14 +272,16 @@ async def test_review_waits_for_capacity_instead_of_immediately_dropping():
             },
         )
 
-    client = JevClient({"mindshub": {"keys": ["fake-key"]}}, transport=transport)
-    pool = client.pools["mindshub"]
+    client = JevClient(
+        {"nanbei": {"keys": ["fake-key"], "concurrency": 1}}, transport=transport
+    )
+    pool = client.pools["nanbei"]
     slot = await pool.acquire()
     task = asyncio.create_task(client.evaluate({"candidate_reply": "draft"}, QUESTIONS))
     await asyncio.sleep(0.02)
     assert not task.done()
     await pool.release(slot)
-    assert (await task)["channel"] == "mindshub"
+    assert (await task)["channel"] == "nanbei"
     assert pool.active == 0
     await client.close()
 
@@ -288,13 +290,13 @@ async def test_review_waits_for_capacity_instead_of_immediately_dropping():
 async def test_explicitly_different_quota_groups_do_not_share_cooldown():
     client = JevClient(
         {
-            "mindshub": {
+            "nanbei": {
                 "keys": ["fake-a", "fake-b"],
                 "quota_group_ids": ["org-a", "org-b"],
             }
         }
     )
-    pools = [p for p in client.pools.values() if p.adapter.kind == "mindshub"]
+    pools = [p for p in client.pools.values() if p.adapter.kind == "nanbei"]
     first = await pools[0].acquire()
     await pools[0].release(first, cooldown=60, shared=True)
     assert await pools[0].acquire() is None
@@ -333,39 +335,12 @@ async def test_scoped_split_adapter_leaves_unmarked_events_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_wakepro_ownership_preserves_explicit_and_unmanaged_rounds():
-    calls = []
-
-    async def handle(self, ctx):
-        calls.append(type(self).__name__)
-        return NS(wake=True)
-
-    steps = [
-        type(name, (), {"handle": handle})()
-        for name in ("DebounceStep", "MentionStep", "WakeStep")
-    ]
-    adapter = WakeAdapters(lambda ev: ev.get_group_id() == "managed")
-    assert adapter.attach(NS(pipeline=NS(_steps=steps)))
-    ev = base.event(group="managed")
-    ctx = NS(
-        event=ev, cmd=None, group=NS(shutup_until=0), member=NS(silence_until=0), now=10
-    )
-    assert (await steps[0].handle(ctx)).wake is None
-    ev.is_at_or_wake_command = True
-    assert (await steps[0].handle(ctx)).wake is True
-    ctx.event = base.event(group="unmanaged")
-    assert (await steps[0].handle(ctx)).wake is True
-    assert len(calls) == 2
-    adapter.restore()
-
-
-@pytest.mark.asyncio
 async def test_burst_window_and_conversation_boundaries(env):
     env.cfg["burst_merge_enabled"] = True
     first = await env.admit(base.event(mid="one"))
     room = env.plugin.rooms.get(first.unified_msg_origin)
     env.plugin._release(first)
-    room.burst["last"] -= 10
+    first.get_extra("_jev_burst_frame").last -= 10
     room.evaluated_at -= 10
     second = base.event(mid="two")
     await env.plugin.on_message(second)
@@ -449,7 +424,7 @@ async def test_review_result_is_invalidated_by_new_message(env):
 
 @pytest.mark.asyncio
 async def test_picture_does_not_start_generation_with_no_judgment_keys(env):
-    env.plugin.client = JevClient({"mindshub": {"keys": []}})
+    env.plugin.client = JevClient({"nanbei": {"keys": []}})
     ev = base.event(parts=[Image.fromURL("https://example.invalid/a.png")])
     await env.plugin.on_message(ev)
     assert not ev.get_extra(MARK)
@@ -457,7 +432,7 @@ async def test_picture_does_not_start_generation_with_no_judgment_keys(env):
 
 
 def test_edge_denial_does_not_permanently_disable_valid_key():
-    code, duration, shared = Adapter.create("mindshub", {}).classify(
+    code, duration, shared = Adapter.create("nanbei", {}).classify(
         403, None, {"server": "cloudflare"}
     )
     assert code == "edge_rejected"
@@ -470,7 +445,7 @@ async def test_confirmed_auth_rejection_can_use_explicitly_enabled_backup():
 
     async def transport(endpoint, key, payload):
         calls.append(endpoint)
-        if "mindshub" in endpoint:
+        if "hajimi.165201.xyz" in endpoint:
             return 401, {}, {"error": {"code": "invalid_api_key"}}
         return (
             200,
@@ -486,7 +461,7 @@ async def test_confirmed_auth_rejection_can_use_explicitly_enabled_backup():
         {
             "retry_explicit_rejection": True,
             "allow_channel_fallback": True,
-            "mindshub": {"keys": ["fake-mindshub"]},
+            "nanbei": {"keys": ["fake-nanbei"]},
             "typesafe": {"keys": ["fake-typesafe"]},
         },
         transport=transport,
@@ -518,7 +493,7 @@ async def test_repeated_requests_leave_no_leases_waiters_or_unbounded_windows():
     keys = [f"fake-key-{i}" for i in range(4)]
     client = JevClient(
         {
-            "mindshub": {
+            "nanbei": {
                 "keys": keys,
                 "quota_rpm": 10000,
                 "key_rpm": 10000,
@@ -530,7 +505,7 @@ async def test_repeated_requests_leave_no_leases_waiters_or_unbounded_windows():
     )
     for _ in range(25):
         await asyncio.gather(*(client.evaluate({}, QUESTIONS) for _ in range(20)))
-    pool = client.pools["mindshub"]
+    pool = client.pools["nanbei"]
     assert len(seen) == 500
     assert [seen.count(key) for key in keys] == [125] * 4
     assert pool.active == 0 and all(k.active == 0 for k in pool.keys)
@@ -582,6 +557,13 @@ async def test_overflow_summarizes_only_auxiliary_evidence_not_original_request(
         prompt="原始消息", system_prompt=original, conversation=NS(cid=env.cid)
     )
     await env.plugin.on_request(ev, req)
+    env.ctx.llm_generate.assert_not_awaited()
+    env.plugin.client.evaluate = AsyncMock(
+        return_value={"values": {"appropriate": 0.9, "redundant": 0.1}}
+    )
+    await env.plugin.on_response(
+        ev, LLMResponse(role="assistant", completion_text="自然接话草稿")
+    )
     env.ctx.llm_generate.assert_awaited_once()
     assert req.system_prompt == original
     assert req.prompt == "原始消息"
@@ -620,6 +602,10 @@ async def test_unavailable_summary_does_not_silently_clip_evidence(env):
     )
     await env.plugin.on_request(ev, req)
     env.ctx.llm_generate.assert_not_called()
+    assert not ev.is_stopped()
+    await env.plugin.on_response(
+        ev, LLMResponse(role="assistant", completion_text="待审草稿")
+    )
     assert ev.is_stopped()
     assert req.system_prompt == "memory " * 50000
 
@@ -627,14 +613,14 @@ async def test_unavailable_summary_does_not_silently_clip_evidence(env):
 @pytest.mark.asyncio
 async def test_channel_cooldown_survives_reload_and_can_be_reset(tmp_path):
     ledger = Ledger(tmp_path / "health.db")
-    first = JevClient({"mindshub": {"keys": ["fake-a"]}})
+    first = JevClient({"nanbei": {"keys": ["fake-a"]}})
     for pool in first.pools.values():
         pool.ledger = ledger
-    pool = first.pools["mindshub"]
+    pool = first.pools["nanbei"]
     key = await pool.acquire()
     await pool.release(key, 3600, True)
     await first.close()
-    second = JevClient({"mindshub": {"keys": ["fake-a"]}})
+    second = JevClient({"nanbei": {"keys": ["fake-a"]}})
     for pool in second.pools.values():
         pool.ledger = ledger
     assert not await second.review_ready()
@@ -645,11 +631,13 @@ async def test_channel_cooldown_survives_reload_and_can_be_reset(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_unavailable_jev_does_not_claim_wakepro(env):
-    env.plugin.client = JevClient({"mindshub": {"keys": []}})
-    ev = base.event()
-    await env.plugin.claim_waking(ev)
-    assert not ev.get_extra("_jev_managed_wakepro")
+async def test_unavailable_jev_still_wakes_by_name_without_wakepro(env):
+    env.plugin.client = JevClient({"nanbei": {"keys": []}})
+    env.cfg["wake_names"] = ["吱吱"]
+    ev = base.event(text="吱吱，你在吗")
+    await env.plugin.on_input(ev)
+    assert ev.is_at_or_wake_command
+    assert not hasattr(env.plugin, "wake_adapters")
 
 
 def test_legacy_inspired_question_override_is_typed_and_has_safe_fallback():

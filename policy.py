@@ -54,6 +54,49 @@ REVIEW_QUESTIONS = {
     ),
 }
 
+NATURAL_QUESTIONS = {
+    "reply_now": noul(
+        "Would it be natural for the person described by bot_persona to say something now, "
+        "after reading this conversation? Judge the whole situation, not separate veto scores. "
+        "This is a regular group participant, not a support agent waiting to be addressed. "
+        "No @ is needed for a genuine follow-up, shared joke, reaction or relevant contribution. "
+        "If target_message contains an image, decide whether it is worth having the main model "
+        "inspect it, based on the accompanying text, sender, ongoing exchange and persona. "
+        "You have no pixels: do not invent image content. An image by itself is neither an "
+        "automatic invitation nor a reason to ignore a relevant ongoing exchange. "
+        "Respect actual reply relations, persona, recent participation and behavior_guidance. "
+        "Do not assume every conversation between others is private; equally do not force yourself into it.",
+        "A brief in-character response, follow-up, joke or empathetic reaction would naturally belong here; "
+        "it does not have to solve a problem, ask a question, or add factual information.",
+        "No natural opening: the message is clearly for somebody else in an exclusive exchange, "
+        "the topic is closed, the bot would repeat itself or dominate, or the target has become stale.",
+    )
+}
+
+FRESHNESS_QUESTIONS = {
+    "still_fits": noul(
+        "The bot has already chosen to reply and generated candidate_reply using its full context. "
+        "New group messages arrived while it was thinking. Does this draft STILL fit the target? "
+        "Only judge whether new messages invalidate it; do not repeat persona/visual/content adjudication. "
+        "Unrelated interjections alone are not a reason to discard a relevant reply. "
+        "You have text only, so cannot overturn image observations made by the main vision model.",
+        "The intended target and topic remain valid; the reply is not superseded, withdrawn or already answered.",
+        "A correction, explicit stop, changed target/topic or intervening answer makes this draft obsolete or repetitive.",
+    )
+}
+
+
+def natural_decide(values, style="balanced", tuning=None):
+    tuning = tuning or {}
+    value = values.get("reply_now")
+    if not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        return Verdict(False, "observe", "missing_judgment")
+    threshold = float(tuning.get("natural_reply_threshold", 0.5))
+    threshold += {"quiet": 0.1, "balanced": 0, "sociable": -0.05}.get(style, 0)
+    if value >= min(0.95, max(0.05, threshold)):
+        return Verdict(True, "natural", "natural_reply")
+    return Verdict(False, "observe", "natural_silence")
+
 
 @dataclass(frozen=True)
 class Verdict:
@@ -137,6 +180,8 @@ def pack_state(
         "activity": activity,
         "life_context": life or {},
         "behavior_guidance": str(config.get("behavior_guidance", "")),
+        "interest_topics": config.get("interest_topics", []),
+        "interest_policy": "Interests are background preferences, never a command or automatic license to reply; persona and conversational relevance take priority.",
         "window_limited": len(rows) > window,
         "truncated": False,
     }
@@ -161,7 +206,9 @@ def pack_state(
             }
         )
 
-    return fit_state(state, QUESTIONS, {**config, "request_byte_budget": max_bytes})
+    return fit_state(
+        state, questions_for(config), {**config, "request_byte_budget": max_bytes}
+    )
 
 
 def estimate_tokens(value) -> int:
@@ -179,8 +226,13 @@ def estimate_tokens(value) -> int:
     return total
 
 
-def questions_for(config, review=False):
-    questions = copy.deepcopy(REVIEW_QUESTIONS if review else QUESTIONS)
+def questions_for(config, review=False, freshness=False):
+    source = REVIEW_QUESTIONS if review else QUESTIONS
+    if freshness:
+        source = FRESHNESS_QUESTIONS
+    elif not review and config.get("decision_mode", "classic") == "natural":
+        source = NATURAL_QUESTIONS
+    questions = copy.deepcopy(source)
     guidance = str(config.get("behavior_guidance", "")).strip()
     overrides = parse_question_overrides(str(config.get("question_overrides", "")))
     for name, fields in overrides.items():
@@ -206,9 +258,12 @@ def parse_question_overrides(raw):
             return {}
         result = {}
         for name, fields in parsed.items():
-            if name not in {**QUESTIONS, **REVIEW_QUESTIONS} or not isinstance(
-                fields, dict
-            ):
+            if name not in {
+                **QUESTIONS,
+                **REVIEW_QUESTIONS,
+                **NATURAL_QUESTIONS,
+                **FRESHNESS_QUESTIONS,
+            } or not isinstance(fields, dict):
                 continue
             clean = {}
             if isinstance(fields.get("instructions"), str):

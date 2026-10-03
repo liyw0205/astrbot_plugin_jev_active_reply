@@ -19,7 +19,7 @@ from .policy import fit_state
 
 ENDPOINTS = {
     "typesafe": ("https://api.typesafe.ai/v1/systemone", "jev-latest"),
-    "mindshub": ("https://api.mindshub.ai/v1/decisions", "jev"),
+    "nanbei": ("https://hajimi.165201.xyz/v1/systemone", "jev-latest"),
 }
 
 
@@ -107,6 +107,8 @@ class Adapter:
         code = error.get("code") or error.get("type")
         if status == 403 and (not isinstance(body, dict) or code == "edge_blocked"):
             return "edge_rejected", 60, True
+        if self.kind == "nanbei" and status == 403:
+            return "site_access_or_balance", 60, True
         if status in (401, 403):
             return "auth_disabled", math.inf, False
         if (
@@ -137,7 +139,7 @@ class Adapter:
 class KeySlot:
     secret: str = field(repr=False)
     ident: str = ""
-    requests: deque = field(default_factory=deque)
+    requests: deque = field(default_factory=lambda: deque(maxlen=10000))
     active: int = 0
     until: float = 0
 
@@ -153,22 +155,28 @@ class KeyPool:
         keys = list(dict.fromkeys(k.strip() for k in raw if k.strip()))
         if any("\n" in k or "\r" in k for k in keys):
             raise ValueError("key contains newline")
+        if kind == "nanbei" and any(k.startswith(("apikey_", "mdb_")) for k in keys):
+            raise ValueError(
+                "Nanbei requires a site API key, not an upstream credential"
+            )
+        if kind == "typesafe" and any(k.startswith(("sk-", "mdb_")) for k in keys):
+            raise ValueError(
+                "TypeSafe requires an official API key, not a relay credential"
+            )
         self.keys = [
             KeySlot(k, hashlib.sha256(k.encode()).hexdigest()[:8]) for k in keys
         ]
-        self.rpm = max(1, min(10000, int(config.get("quota_rpm", 55))))
-        self.key_rpm = max(1, min(self.rpm, int(config.get("key_rpm", 55))))
-        self.concurrency = max(1, min(20, int(config.get("concurrency", 2))))
-        self.requests = deque()
+        self.rpm = max(0, min(10000, int(config.get("quota_rpm", 0))))
+        self.key_rpm = max(0, min(10000, int(config.get("key_rpm", 0))))
+        self.concurrency = max(1, min(20, int(config.get("concurrency", 8))))
+        self.requests = deque(maxlen=10000)
         self.active = 0
         self.until = 0.0
         self.cursor = 0
         self.clock = clock
         self.lock = asyncio.Lock()
         self.ledger = None
-        self.daily_limit = max(
-            0, int(config.get("daily_request_limit", 80 if kind == "mindshub" else 500))
-        )
+        self.daily_limit = max(0, int(config.get("daily_request_limit", 0)))
         self.scope = "channel:" + kind + str(config.get("_quota_scope", ""))
         self.changed = None
         self.health_loaded = False
@@ -191,7 +199,7 @@ class KeyPool:
             if (
                 now < self.until
                 or self.active >= self.concurrency
-                or len(self.requests) >= self.rpm
+                or (self.rpm and len(self.requests) >= self.rpm)
             ):
                 return None
             if (
@@ -205,7 +213,9 @@ class KeyPool:
                 key = self.keys[index]
                 while key.requests and key.requests[0] <= now - 60:
                     key.requests.popleft()
-                if key.active or now < key.until or len(key.requests) >= self.key_rpm:
+                if now < key.until or (
+                    self.key_rpm and len(key.requests) >= self.key_rpm
+                ):
                     continue
                 # Commit quota before taking an in-memory lease. A failed or
                 # cancelled write can overcount an attempt, never leak a slot.
@@ -260,14 +270,14 @@ class KeyPool:
 class JevClient:
     def __init__(self, config: dict, transport=None, clock=time.monotonic):
         self.config = config
-        primary = config.get("primary_channel", "mindshub")
+        primary = config.get("primary_channel", "nanbei")
         if primary not in ENDPOINTS:
             raise ValueError("invalid primary_channel")
         self.order = [primary]
         if config.get("allow_channel_fallback", False):
             self.order += [k for k in ENDPOINTS if k != primary]
         self.pools = {}
-        for kind in ENDPOINTS:
+        for kind in self.order:
             cfg = config.get(kind, {})
             groups = cfg.get("quota_group_ids", [])
             keys = cfg.get("keys", [])
@@ -388,12 +398,16 @@ class JevClient:
                     now = pool.clock()
                     if pool.until > now:
                         delays.append(pool.until - now)
-                    if pool.requests and len(pool.requests) >= pool.rpm:
+                    if pool.rpm and pool.requests and len(pool.requests) >= pool.rpm:
                         delays.append(pool.requests[0] + 60 - now)
                     for key in pool.keys:
                         if math.isfinite(key.until) and key.until > now:
                             delays.append(key.until - now)
-                        if key.requests and len(key.requests) >= pool.key_rpm:
+                        if (
+                            pool.key_rpm
+                            and key.requests
+                            and len(key.requests) >= pool.key_rpm
+                        ):
                             delays.append(key.requests[0] + 60 - now)
                 try:
                     await asyncio.wait_for(
@@ -418,7 +432,7 @@ class JevClient:
             json=payload,
             headers={
                 "Authorization": f"Bearer {key}",
-                "User-Agent": "JevActiveReply/0.2.1",
+                "User-Agent": "JevActiveReply/0.8.0",
             },
             allow_redirects=False,
         ) as response:

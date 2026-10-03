@@ -12,6 +12,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from .burst import BurstBook
 
 
 def scope_id(umo: str) -> str:
@@ -34,7 +35,13 @@ class Room:
     sent_times: deque = field(default_factory=lambda: deque(maxlen=30))
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     phase: str = "idle"
-    burst: dict = field(default_factory=dict)
+    bursts: BurstBook = field(default_factory=BurstBook)
+    ingress_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    quiet_until: float = 0
+    quiet_loaded: bool = False
+    quiet_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    quiet_senders: dict = field(default_factory=dict)
+    direct_wakes: dict = field(default_factory=dict)
 
     def notify(self):
         signal, self.changed = self.changed, asyncio.Event()
@@ -61,10 +68,8 @@ class Room:
         return True
 
     def busy(self, now: float, timeout=120) -> bool:
-        if self.pending and now - self.pending_since > timeout:
-            self.pending = ""
-            self.phase = "idle"
-            self.notify()
+        # Only the owner/lease can release a ticket; never expire a 180s request
+        # through this old 120s housekeeping default.
         return bool(self.pending)
 
     def release(self, ticket: str):
@@ -139,7 +144,18 @@ class Ledger:
             k: v
             for k, v in (details or {}).items()
             if k
-            in ("channel", "key_id", "model", "values", "mode", "status", "truncated")
+            in (
+                "channel",
+                "key_id",
+                "model",
+                "values",
+                "mode",
+                "status",
+                "truncated",
+                "turn_id",
+                "elapsed_ms",
+                "stage_ms",
+            )
         }
         with self.lock, self.db:
             self.db.execute(

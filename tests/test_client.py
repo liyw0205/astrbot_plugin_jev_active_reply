@@ -29,14 +29,12 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = Ledger(Path(directory) / "daily.db")
             for _ in range(2):
-                pool = KeyPool(
-                    "mindshub", {"keys": ["a", "b"], "daily_request_limit": 2}
-                )
+                pool = KeyPool("nanbei", {"keys": ["a", "b"], "daily_request_limit": 2})
                 pool.ledger = store
                 key = await pool.acquire()
                 self.assertIsNotNone(key)
                 await pool.release(key)
-            pool = KeyPool("mindshub", {"keys": ["c"], "daily_request_limit": 2})
+            pool = KeyPool("nanbei", {"keys": ["c"], "daily_request_limit": 2})
             pool.ledger = store
             self.assertIsNone(await pool.acquire())
             official = KeyPool("typesafe", {"keys": ["official"]})
@@ -45,7 +43,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             store.close()
 
     async def test_each_channel_rotates(self):
-        for kind in ("typesafe", "mindshub"):
+        for kind in ("typesafe", "nanbei"):
             pool = KeyPool(kind, {"keys": ["a", "b", "c"]})
             got = []
             for _ in range(6):
@@ -56,7 +54,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shared_quota_and_expiration(self):
         clock = Clock()
-        pool = KeyPool("mindshub", {"keys": ["a", "b"], "quota_rpm": 2}, clock)
+        pool = KeyPool("nanbei", {"keys": ["a", "b"], "quota_rpm": 2}, clock)
         for _ in range(2):
             key = await pool.acquire()
             await pool.release(key)
@@ -78,29 +76,29 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", repr(key))
 
     async def test_shared_backoff(self):
-        pool = KeyPool("mindshub", {"keys": ["a", "b"]})
+        pool = KeyPool("nanbei", {"keys": ["a", "b"]})
         key = await pool.acquire()
         await pool.release(key, 60, True)
         self.assertIsNone(await pool.acquire())
 
     async def test_duplicate_keys_do_not_multiply_budget(self):
-        pool = KeyPool("mindshub", {"keys": ["a", " a ", ""]})
+        pool = KeyPool("nanbei", {"keys": ["a", " a ", ""]})
         self.assertEqual(len(pool.keys), 1)
 
 
 class ContractTests(unittest.TestCase):
     def test_endpoints_and_aliases(self):
         a = Adapter.create("typesafe", {})
-        b = Adapter.create("mindshub", {})
+        b = Adapter.create("nanbei", {})
         self.assertTrue(a.endpoint.endswith("/v1/systemone"))
-        self.assertTrue(b.endpoint.endswith("/v1/decisions"))
+        self.assertTrue(b.endpoint.endswith("/v1/systemone"))
         self.assertEqual(a.model, "jev-latest")
-        self.assertEqual(b.model, "jev")
+        self.assertEqual(b.model, "jev-latest")
         self.assertEqual(set(a.encode({}, QUESTIONS)), {"model", "state", "questions"})
         self.assertEqual(a.decode(answer(), QUESTIONS), b.decode(answer(), QUESTIONS))
 
     def test_no_chat_parameters(self):
-        body = Adapter.create("mindshub", {}).encode({}, QUESTIONS)
+        body = Adapter.create("nanbei", {}).encode({}, QUESTIONS)
         self.assertFalse(
             {"messages", "temperature", "max_tokens", "stream"} & body.keys()
         )
@@ -116,10 +114,10 @@ class ContractTests(unittest.TestCase):
         body = answer()
         del body["answers"]["intrusive"]
         with self.assertRaises(DecisionError):
-            Adapter.create("mindshub", {}).decode(body, QUESTIONS)
+            Adapter.create("nanbei", {}).decode(body, QUESTIONS)
 
     def test_gateway_503_is_not_user_auth_error(self):
-        adapter = Adapter.create("mindshub", {})
+        adapter = Adapter.create("nanbei", {})
         code, delay, shared = adapter.classify(
             503, {"error": {"upstream_status": 502}}, {}
         )
@@ -128,7 +126,7 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(shared)
 
     def test_billing_is_distinct(self):
-        adapter = Adapter.create("mindshub", {})
+        adapter = Adapter.create("nanbei", {})
         self.assertEqual(
             adapter.classify(
                 429, {"error": {"code": "included_allowance_exhausted"}}, {}
@@ -165,7 +163,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
                 "primary_channel": "typesafe",
                 "allow_channel_fallback": True,
                 "typesafe": {"keys": ["official1", "official2"], "quota_rpm": 2},
-                "mindshub": {"keys": ["hub1", "hub2"]},
+                "nanbei": {"keys": ["hub1", "hub2"]},
             },
             transport,
         )
@@ -174,9 +172,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [c[1] for c in calls], ["official1", "official2", "hub1", "hub2"]
         )
-        self.assertEqual(
-            [c[2] for c in calls], ["jev-latest", "jev-latest", "jev", "jev"]
-        )
+        self.assertEqual([c[2] for c in calls], ["jev-latest"] * 4)
 
     async def test_no_retry_on_any_post_failure(self):
         for status in (401, 403, 402, 429, 503, 529):
@@ -189,7 +185,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             client = JevClient(
                 {
                     "allow_channel_fallback": True,
-                    "mindshub": {"keys": ["hub1", "hub2"]},
+                    "nanbei": {"keys": ["hub1", "hub2"]},
                     "typesafe": {"keys": ["official"]},
                 },
                 transport,
@@ -197,7 +193,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(DecisionError):
                 await client.evaluate({}, QUESTIONS)
             self.assertEqual(calls, ["hub1"])
-            self.assertEqual(client.pools["mindshub"].active, 0)
+            self.assertEqual(client.pools["nanbei"].active, 0)
 
     async def test_cancel_releases_reservation(self):
         entered = asyncio.Event()
@@ -206,21 +202,21 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await asyncio.sleep(100)
 
-        client = JevClient({"mindshub": {"keys": ["hub"]}}, transport)
+        client = JevClient({"nanbei": {"keys": ["hub"]}}, transport)
         task = asyncio.create_task(client.evaluate({}, QUESTIONS))
         await entered.wait()
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.assertEqual(client.pools["mindshub"].active, 0)
-        self.assertEqual(len(client.pools["mindshub"].requests), 1)
+        self.assertEqual(client.pools["nanbei"].active, 0)
+        self.assertEqual(len(client.pools["nanbei"].requests), 1)
 
     async def test_budget_precedes_request(self):
         async def never_send(*args):
             self.fail("Over-budget input must never reach the transport")
 
         client = JevClient(
-            {"request_byte_budget": 8000, "mindshub": {"keys": ["hub"]}},
+            {"request_byte_budget": 8000, "nanbei": {"keys": ["hub"]}},
             transport=never_send,
         )
         try:
@@ -228,7 +224,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
                 DecisionError, "protected_context_exceeds_safety_budget"
             ):
                 await client.evaluate({"text": "汉" * 10000}, QUESTIONS)
-            self.assertEqual(client.pools["mindshub"].active, 0)
-            self.assertEqual(len(client.pools["mindshub"].requests), 0)
+            self.assertEqual(client.pools["nanbei"].active, 0)
+            self.assertEqual(len(client.pools["nanbei"].requests), 0)
         finally:
             await client.close()

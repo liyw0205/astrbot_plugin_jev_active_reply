@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 import weakref
 import hashlib
 import json
+from contextvars import ContextVar
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -18,9 +19,10 @@ from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 from astrbot.core.star.star_tools import StarTools
 
-from . import bridge
+from . import bridge, silence, burst
+from .admission import guard_exempt, input_decision
 from .client import DecisionError, JevClient
-from .delivery import DeliveryDeclined, EventBotProxy, SplitAdapters, WakeAdapters
+from .delivery import DeliveryDeclined, EventBotProxy, SplitAdapters
 from .policy import (
     Verdict,
     decide,
@@ -28,8 +30,10 @@ from .policy import (
     fit_state,
     is_refusal,
     questions_for,
+    natural_decide,
 )
-from .state import Ledger, RoomBook
+from .state import Ledger, RoomBook, scope_id
+from .settings import ConfigView
 
 MARK = "_jev_active_reply_v1"
 NORMAL = "_jev_observed_response"
@@ -39,8 +43,8 @@ class JevActiveReply(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.context = context
-        self.config = config
-        self.client = JevClient(config)
+        self.config = ConfigView(config)
+        self.client = JevClient(self.config)
         self.rooms = RoomBook()
         self.ledger = Ledger(
             StarTools.get_data_dir("astrbot_plugin_jev_active_reply")
@@ -56,16 +60,16 @@ class JevActiveReply(Star):
         self.audit_task = None
         self.last_storage_warning = 0
         self.split_adapters = SplitAdapters(MARK)
-        self.wake_adapters = WakeAdapters(
-            lambda event: (
-                bool(event.get_extra("_jev_managed_wakepro")) and not self.closed
-            )
-        )
+        self.ignored_background = silence.IgnoredBackground()
+        self.config_lock = asyncio.Lock()
 
     def _cfg(self, key, default):
         return self.config.get(key, default)
 
-    def _enabled(self, event):
+    def _lifetime(self):
+        return min(180, max(15, float(self._cfg("request_lifetime_seconds", 90))))
+
+    def _in_scope(self, event):
         if (
             self.closed
             or not self._cfg("enabled", True)
@@ -74,10 +78,13 @@ class JevActiveReply(Star):
         ):
             return False
         allow = self._cfg("enabled_sessions", [])
-        deny = self._cfg("disabled_sessions", [])
         umo, gid = event.unified_msg_origin, str(event.get_group_id())
-        return not any(x in deny for x in (umo, gid)) and any(
-            x in allow for x in ("*", umo, gid)
+        return any(x in allow for x in ("*", umo, gid))
+
+    def _enabled(self, event):
+        deny = self._cfg("disabled_sessions", [])
+        return self._in_scope(event) and not any(
+            x in deny for x in (event.unified_msg_origin, str(event.get_group_id()))
         )
 
     @staticmethod
@@ -86,11 +93,139 @@ class JevActiveReply(Star):
             event.is_stopped()
             or bool(event.get_extra("agent_stop_requested"))
             or bool(event.get_extra("_suanle_silent_requested"))
+            or bool(event.get_extra(silence.SILENT))
         )
+
+    def _silence_settings(self):
+        return self._cfg("silence", {})
+
+    def _silence_scope(self, event):
+        cfg = self._silence_settings()
+        scopes = cfg.get("sessions", ["*"])
+        return (
+            not self.closed
+            and self._cfg("enabled", True)
+            and not self._cfg("dry_run", False)
+            and cfg.get("enable", True)
+            and any(
+                x in scopes
+                for x in ("*", event.unified_msg_origin, str(event.get_group_id()))
+            )
+        )
+
+    def _can_keep_silent(self, event):
+        cfg = self._silence_settings()
+        return (
+            self._silence_scope(event)
+            and cfg.get("tool_enable", True)
+            and not silence.must_reply(event, cfg)
+            and (
+                bool(event.get_extra(MARK))
+                or cfg.get(
+                    "private_replies" if event.is_private_chat() else "normal_replies",
+                    True,
+                )
+            )
+        )
+
+    def _finish_silent(self, event, reason="model_keep_silent"):
+        if not event.get_extra(silence.SILENT):
+            try:
+                silence.release_follow_ups(event)
+            except Exception:
+                self._note(event, "silence_follow_up_contract_unavailable")
+            event.set_extra(silence.SILENT, True)
+            meta = event.get_extra(MARK)
+            if meta:
+                meta["rejected"] = True
+                meta["finished"] = True
+                self._release(event)
+            self._note(event, reason)
+        silence.clear_output(event)
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=2000000)
+    async def capture_ignored(self, event: AstrMessageEvent):
+        mid = silence.recall_id(event)
+        if mid is not None:
+            self.ignored_background.recall(event.unified_msg_origin, mid)
+            event.set_extra("_jev_recall_notice", True)
+            return
+        if not self._silence_scope(event) or self._blocked(event):
+            return
+        cfg = self._silence_settings()
+        admins = self.context.get_config().get("admins_id", [])
+        if silence.ignored(event, cfg, admins):
+            self.ignored_background.record(event, cfg)
+            event.stop_event()
+            self._note(event, "ignored_speaker_background_only")
+
+    @filter.on_llm_request(priority=90)
+    async def prepare_silence(self, event: AstrMessageEvent, req):
+        if not self._silence_scope(event) or self._blocked(event):
+            return
+        cfg = self._silence_settings()
+        background = self.ignored_background.text(event.unified_msg_origin, cfg)
+        if background and not event.get_extra("_jev_ignored_context_added"):
+            req.extra_user_content_parts.append(
+                TextPart(text=background).mark_as_temp()
+            )
+            event.set_extra("_jev_ignored_context_added", True)
+        tools = getattr(req, "func_tool", None)
+        if not tools:
+            return
+        allowed = self._can_keep_silent(event)
+        if not allowed:
+            req.func_tool = copy.copy(tools)
+            req.func_tool.tools = [
+                tool for tool in tools.tools if tool.name != "keep_silent"
+            ]
+            return
+        if event.get_extra(MARK) or event.get_extra("_jev_silence_policy_added"):
+            return  # Autonomous rounds already receive a single consolidated policy.
+        if any(tool.name == "keep_silent" for tool in tools.tools):
+            req.extra_user_content_parts.append(
+                TextPart(
+                    text=(
+                        "你可以在读完上下文、图片或工具结果后调用 keep_silent 结束本轮，不发送任何话。"
+                        "保持当前人设；正常明确提问应认真回应，不因短句、没有新问题或没有@就机械沉默。"
+                        "仅在不适合回应、对方要求安静、已无须重复或人设确实不愿回应时使用。沉默时不解释原因。"
+                    )
+                ).mark_as_temp()
+            )
+            event.set_extra("_jev_silence_policy_added", True)
+
+    @filter.llm_tool(name="keep_silent")
+    async def keep_silent(
+        self, event: AstrMessageEvent, reason: str = "", confidence: float = 1.0
+    ) -> str | None:
+        """决定不回复并结束本轮，不向聊天发送文字。
+
+        Args:
+            reason(string): 简短的沉默理由，仅供当前决策，不发送或持久化。
+            confidence(number): 应当沉默的置信度，0 到 1。
+        """
+        if event.get_extra(silence.RECALL) or event.get_extra("agent_stop_requested"):
+            return None
+        if not self._can_keep_silent(event):
+            return "当前会话不允许自主沉默，请正常回应；不要输出沉默标记。"
+        self._finish_silent(event)
+        return None  # Native ToolLoopAgentRunner transitions to DONE without another LLM call.
+
+    @filter.on_agent_done(priority=1000000)
+    async def silence_agent_done(self, event: AstrMessageEvent, run_context, response):
+        if event.get_extra(silence.SILENT):
+            silence.clear_output(event, response)
 
     def _note(self, event, reason, details=None):
         if self.closed:
             return
+        meta = event.get_extra(MARK)
+        if meta:
+            details = {
+                **(details or {}),
+                "turn_id": meta["ticket"],
+                "elapsed_ms": round((time.monotonic() - meta["created"]) * 1000),
+            }
         self.audit_queue.append((event.unified_msg_origin, reason, details))
         if self.audit_task is None or self.audit_task.done():
             self.audit_task = asyncio.create_task(self._drain_audit())
@@ -111,6 +246,7 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             return
+        burst.close(event)
         lease = meta.pop("lease", None)
         if lease:
             lease.cancel()
@@ -124,12 +260,15 @@ class JevActiveReply(Star):
         room = self.rooms.rooms.get(event.unified_msg_origin)
         if not meta or self.closed or self._blocked(event) or meta.get("rejected"):
             return False
+        if room:
+            await self._load_quiet(event, room)
+        if self._quiet(event, room):
+            self._reject(event, None, "quiet_before_delivery")
+            return False
         if not meta.get("reviewed") or not meta.get("output_ready"):
             self._reject(event, None, "unapproved_output_suppressed")
             return False
-        if time.monotonic() - meta["created"] > float(
-            self._cfg("request_lifetime_seconds", 90)
-        ):
+        if time.monotonic() - meta["created"] > self._lifetime():
             self._reject(event, None, "delivery_expired")
             return False
         try:
@@ -137,14 +276,61 @@ class JevActiveReply(Star):
         except Exception:
             self._reject(event, None, "delivery_context_unavailable")
             return False
+        # Revalidate after the final await: expiry/recall/replacement may have won.
+        if (
+            self.closed
+            or self._blocked(event)
+            or meta.get("rejected")
+            or self._quiet(event, room)
+        ):
+            return False
+        if time.monotonic() - meta["created"] > self._lifetime():
+            self._reject(event, None, "delivery_expired")
+            return False
         if (
             (meta["cid"] and cid != meta["cid"])
             or room is None
-            or room.generation != meta.get("approved_generation")
+            or room.pending != meta["ticket"]
+            or (
+                not meta.get("committed")
+                and room.generation != meta.get("approved_generation")
+            )
         ):
             self._reject(event, None, "delivery_context_changed")
             return False
         return True
+
+    @staticmethod
+    def _quiet(event, room):
+        now = time.monotonic()
+        return bool(
+            room
+            and (
+                room.quiet_until > now
+                or room.quiet_senders.get(str(event.get_sender_id()), 0) > now
+            )
+        )
+
+    async def _load_quiet(self, event, room):
+        async with room.quiet_lock:
+            if not room.quiet_loaded:
+                until = await self.ledger.acooldown(
+                    "room_quiet:" + scope_id(event.unified_msg_origin)
+                )
+                room.quiet_until = (
+                    time.monotonic() + max(0, until - time.time()) if until else 0
+                )
+                room.quiet_loaded = True
+
+    def _cancel_room_candidates(self, event, room, sender=None):
+        # Also invalidate candidates still waiting for a judge, not yet in pending_events.
+        room.generation += 1
+        room.notify()
+        for old in list(self.pending_events.values()):
+            if old.unified_msg_origin == event.unified_msg_origin and (
+                sender is None or str(old.get_sender_id()) == sender
+            ):
+                self._reject(old, None, "user_requested_quiet")
 
     async def _accepted(self, event):
         meta = event.get_extra(MARK)
@@ -154,6 +340,10 @@ class JevActiveReply(Star):
         if meta.get("committed"):
             return
         meta["committed"] = True
+        frame = event.get_extra(burst.FRAME)
+        if frame:
+            frame.committed = True
+            frame.closed = True
         room = self.rooms.rooms.get(event.unified_msg_origin)
         if room:
             room.cid = meta["cid"]
@@ -177,29 +367,35 @@ class JevActiveReply(Star):
 
     def _install_sender(self, event):
         original_send = event.send
+        nested = ContextVar("jev_delivery_owner", default=None)
 
         async def send_operation(operation, *args, **kwargs):
+            task = asyncio.current_task()
+            if nested.get() is task:
+                return await operation(*args, **kwargs)
             if not await self._permit(event):
                 raise DeliveryDeclined("autonomous_delivery_cancelled")
             meta = event.get_extra(MARK)
-            depth = meta.get("send_depth", 0)
-            meta["send_depth"] = depth + 1
-            task = asyncio.current_task()
-            if depth == 0:
-                self.tasks.add(task)
+            token = nested.set(task)
+            meta["send_depth"] = meta.get("send_depth", 0) + 1
+            frame = event.get_extra(burst.FRAME)
+            if frame:
+                frame.sending += 1
+            self.tasks.add(task)
             try:
                 result = await operation(*args, **kwargs)
             except BaseException:
                 self._reject(event, None, "delivery_failed_or_cancelled")
                 raise
             else:
-                if depth == 0:
-                    await self._accepted(event)
+                await self._accepted(event)
                 return result
             finally:
-                meta["send_depth"] = depth
-                if depth == 0:
-                    self.tasks.discard(task)
+                meta["send_depth"] -= 1
+                if frame:
+                    frame.sending -= 1
+                nested.reset(token)
+                self.tasks.discard(task)
 
         async def send(chain, *args, **kwargs):
             return await send_operation(original_send, chain, *args, **kwargs)
@@ -249,12 +445,12 @@ class JevActiveReply(Star):
         }
 
     def _coalesce(self, event, room, cid):
-        if self._cfg("dry_run", True) or not self._cfg("burst_merge_enabled", True):
+        if self._cfg("dry_run", False) or not self._cfg("burst_merge_enabled", True):
             return
         now = time.monotonic()
         seconds = min(30, max(0, float(self._cfg("burst_window_seconds", 5))))
-        previous = room.burst
         sender = str(event.get_sender_id())
+        previous = room.bursts.get(sender, cid, now)
         text = (
             event.get_extra("_gemini_stt_transcript") or event.get_message_str() or ""
         )
@@ -262,32 +458,43 @@ class JevActiveReply(Star):
         mid = str(getattr(event.message_obj, "message_id", ""))
         merge = (
             previous
-            and previous["sender"] == sender
-            and previous.get("cid") == cid
-            and now - previous["last"] <= seconds
-            and now - previous["started"] <= 30
-            and len(previous["ids"])
+            and not previous.closed
+            and not previous.committed
+            and not previous.sending
+            and now - previous.last <= seconds
+            and now - previous.started <= 30
+            and len(previous.ids)
             < min(12, max(2, int(self._cfg("burst_max_messages", 8))))
         )
         if merge:
-            old = previous["event"]()
+            old = previous.event_ref()
             old_meta = old.get_extra(MARK) if old else None
             if old_meta and (old_meta.get("sent_parts") or old_meta.get("send_depth")):
                 merge = False
+            if not burst.attachments_available(previous.parts):
+                self._note(event, "burst_attachment_expired")
+                merge = False
         if merge:
-            combined = [*previous["texts"], text]
-            merged_parts = [*previous["parts"], *parts]
-            images = sum(type(p).__name__ == "Image" for p in merged_parts)
-            if len("\n".join(combined).encode()) > 131072 or images > 12:
+            combined = [*previous.texts, text]
+            merged_parts = [*previous.parts, *parts]
+            images = sum(type(p).__name__ == "Image" for p in burst.walk(merged_parts))
+            if (
+                len("\n".join(combined).encode()) > 131072
+                or images > 12
+                or len(merged_parts) > 256
+                or burst.payload_size(combined, merged_parts) > 262144
+            ):
                 self._note(event, "burst_capacity_reached")
                 merge = False
         if merge:
+            if old:
+                burst.transfer_attachments(old, event, previous.parts)
             if old and (old_meta or old.get_extra("_jev_candidate_running")):
                 old.set_extra("agent_stop_requested", True)
                 old.stop_event()
                 if old_meta:
                     self._reject(old, None, "burst_replaced_before_delivery")
-                previous_task = previous.get("task")
+                previous_task = previous.task_ref() if previous.task_ref else None
                 if (
                     previous_task
                     and previous_task is not asyncio.current_task()
@@ -305,66 +512,166 @@ class JevActiveReply(Star):
             event.message_obj.message_str = merged_text
             event.message_str = merged_text
             event.set_extra("_jev_combined_text", merged_text)
-            event.set_extra("_jev_merged_message_ids", [*previous["ids"], mid])
-            room.burst = {
-                **previous,
-                "last": now,
-                "texts": combined,
-                "parts": merged_parts,
-                "ids": [*previous["ids"], mid],
-                "event": weakref.ref(event),
-                "task": asyncio.current_task(),
-            }
+            event.set_extra("_jev_merged_message_ids", [*previous.ids, mid])
             self._note(event, "burst_merged")
-        else:
-            room.burst = {
-                "sender": sender,
-                "cid": cid,
-                "started": now,
-                "last": now,
-                "texts": [text],
-                "parts": parts,
-                "ids": [mid],
-                "event": weakref.ref(event),
-                "task": asyncio.current_task(),
-            }
+        frame = burst.BurstFrame(
+            sender=sender,
+            cid=cid,
+            started=previous.started if merge else now,
+            last=now,
+            texts=combined if merge else [text],
+            parts=merged_parts if merge else parts,
+            ids=[*previous.ids, mid] if merge else [mid],
+            event_ref=weakref.ref(event),
+            task_ref=weakref.ref(asyncio.current_task())
+            if asyncio.current_task()
+            else None,
+            size=burst.payload_size(
+                combined if merge else [text], merged_parts if merge else parts
+            ),
+        )
+        event.set_extra(burst.FRAME, frame)
+        room.bursts.put(frame)
 
     async def initialize(self):
         logger.info(
             "[JevActive] loaded in %s mode; both channel pools ready; no startup API probe",
-            "shadow" if self._cfg("dry_run", True) else "live",
+            "shadow" if self._cfg("dry_run", False) else "live",
         )
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000000)
-    async def claim_waking(self, event: AstrMessageEvent):
+    async def on_input(self, event: AstrMessageEvent):
+        if event.get_extra("_jev_recall_notice"):
+            return
         if (
-            self._enabled(event)
-            and not self._cfg("dry_run", True)
-            and self._cfg("manage_wakepro", True)
+            self.closed
+            or not self._cfg("enabled", True)
+            or self._cfg("dry_run", False)
+            or self._blocked(event)
+            or event.is_private_chat()
+            or event.get_platform_name() != "aiocqhttp"
+            or event.get_extra("_jev_recall_notice")
         ):
-            try:
-                ready = await self.client.review_ready()
-            except Exception:
-                ready = False
-            if ready:
-                plugin = bridge.instance(self.context, event, "astrbot_plugin_wakepro")
-                if self.wake_adapters.attach(plugin):
-                    event.set_extra("_jev_managed_wakepro", True)
+            return
+        allow = self._cfg("enabled_sessions", [])
+        if not any(
+            value in allow
+            for value in ("*", event.unified_msg_origin, str(event.get_group_id()))
+        ):
+            return
+        room = self.rooms.get(event.unified_msg_origin)
+        if room is None:
+            return
+        settings = self.context.get_config(umo=event.unified_msg_origin)
+        action, reason = input_decision(
+            event, self.config, room.last_text, settings.get("wake_prefix", [])
+        )
+        event.set_extra("_jev_input_action", action)
+        if action == "block":
+            event.stop_event()
+            self._note(event, reason)
+            return
+        if reason == "reply_wake_disabled" and not event.get_extra(
+            "handlers_parsed_params"
+        ):
+            raw = "".join(
+                str(getattr(p, "text", ""))
+                for p in event.get_messages()
+                if type(p).__name__ == "Plain"
+            ).strip()
+            if not any(
+                prefix and raw.startswith(prefix)
+                for prefix in settings.get("wake_prefix", [])
+            ):
+                event.is_at_or_wake_command = False
+        if reason == "management_command":
+            return
+        # Registered commands keep their native permission and handler path.
+        if event.get_extra("handlers_parsed_params"):
+            return
+        if action == "skip" and not event.is_at_or_wake_command:
+            return
+        if action in ("pass", "skip") and event.is_at_or_wake_command:
+            action, reason = "direct", "native_explicit_wake"
+        await self._load_quiet(event, room)
+        sender = str(event.get_sender_id())
+        now = time.monotonic()
+        room.quiet_senders = {
+            uid: until for uid, until in room.quiet_senders.items() if until > now
+        }
+        if action == "quiet":
+            if len(room.quiet_senders) >= 128:
+                room.quiet_senders.pop(next(iter(room.quiet_senders)))
+            room.quiet_senders[sender] = now + max(
+                1, min(3600, float(self._cfg("quiet_request_seconds", 300)))
+            )
+            self._cancel_room_candidates(event, room, sender)
+            event.stop_event()
+            self._note(event, "user_requested_quiet")
+            return
+        if action == "resume":
+            room.quiet_senders.pop(sender, None)
+            action = "direct"
+        if room.quiet_until > now and not guard_exempt(event, self.config):
+            event.stop_event()
+            self._note(event, "room_quiet")
+            return
+        if action == "direct":
+            room.quiet_senders.pop(sender, None)
+            cooldown = max(0, min(10, float(self._cfg("direct_wake_interval", 0.5))))
+            if (
+                not guard_exempt(event, self.config)
+                and now - room.direct_wakes.get(sender, -1e12) < cooldown
+            ):
+                event.stop_event()
+                self._note(event, "direct_wake_cooldown")
+                return
+            room.direct_wakes = {
+                uid: stamp
+                for uid, stamp in room.direct_wakes.items()
+                if now - stamp < 10
+            }
+            if len(room.direct_wakes) >= 128:
+                room.direct_wakes.pop(next(iter(room.direct_wakes)))
+            room.direct_wakes[sender] = now
+            event.is_at_or_wake_command = True
+            event.set_extra("_jev_direct_wake", reason)
+            self._note(event, reason)
+        elif sender in room.quiet_senders and not guard_exempt(event, self.config):
+            event.stop_event()
+            self._note(event, "sender_quiet")
 
     # Run after ContextAware and ordinary message handlers; no pre-emptive stop_event.
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-1000)
     async def on_message(self, event: AstrMessageEvent):
-        if not self._enabled(event) or self._blocked(event):
+        if (
+            not self._enabled(event)
+            or self._blocked(event)
+            or event.get_extra("_jev_recall_notice")
+        ):
+            return
+        if event.get_extra("_jev_input_action") in ("skip", "block"):
+            return
+        plain = str(event.get_message_str() or "").strip()
+        if any(
+            prefix and plain.startswith(prefix)
+            for prefix in self._cfg("skip_command_prefixes", ["/", "!"])
+        ):
+            self._note(event, "command_not_an_autonomous_topic")
             return
         for old in list(self.pending_events.values()):
             meta = old.get_extra(MARK)
-            if meta and time.monotonic() - meta["created"] > 120:
+            if meta and time.monotonic() - meta["created"] > self._lifetime():
                 old.set_extra("agent_stop_requested", True)
                 self._reject(old, None, "expired_request")
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return
         room = self.rooms.get(event.unified_msg_origin)
         if room is None:
+            return
+        if not self._cfg("dry_run", False):
+            await self._load_quiet(event, room)
+        if self._quiet(event, room):
             return
         target = self._outline(event)
         if len(str(target).encode()) > 262144:
@@ -413,7 +720,7 @@ class JevActiveReply(Star):
             return
         if not target["content"].strip() and not target["actual_media"]:
             return
-        if self._cfg("strict_conflicts", True) and not self._cfg("dry_run", True):
+        if self._cfg("strict_conflicts", True) and not self._cfg("dry_run", False):
             found = bridge.conflicts(self.context, event)
             if found:
                 self._note(event, "competing_waker")
@@ -425,14 +732,21 @@ class JevActiveReply(Star):
                         ",".join(found),
                     )
                 return
-        try:
-            cid, _ = await asyncio.wait_for(bridge.conversation(self.context, event), 3)
-        except Exception:
-            self._note(event, "conversation_unavailable")
-            return
+        # Record segments in ingress order even if a newer fragment arrived while
+        # the conversation lookup awaited I/O. Stale candidates do not generate.
+        async with room.ingress_lock:
+            try:
+                cid, _ = await asyncio.wait_for(
+                    bridge.conversation(self.context, event), 3
+                )
+            except Exception:
+                self._note(event, "conversation_unavailable")
+                return
+            if self._blocked(event):
+                return
+            self._coalesce(event, room, cid)
         if generation != room.generation or self._blocked(event):
             return
-        self._coalesce(event, room, cid)
         target = self._outline(event)
         task = asyncio.current_task()
         self.tasks.add(task)
@@ -443,7 +757,7 @@ class JevActiveReply(Star):
                 30, max(1, float(self._cfg("candidate_wait_seconds", 15)))
             )
             while (
-                room.busy(time.monotonic())
+                (room.busy(time.monotonic()) or bridge.native_busy(event))
                 and generation == room.generation
                 and not self._blocked(event)
             ):
@@ -453,10 +767,11 @@ class JevActiveReply(Star):
                     return
                 signal = room.changed
                 try:
-                    await asyncio.wait_for(signal.wait(), remaining)
+                    await asyncio.wait_for(signal.wait(), min(remaining, 0.5))
                 except asyncio.TimeoutError:
-                    self._note(event, "candidate_wait_expired")
-                    return
+                    if time.monotonic() >= deadline:
+                        self._note(event, "candidate_wait_expired")
+                        return
             if generation != room.generation or self._blocked(event):
                 return
             await self._evaluate(event, room, target, generation)
@@ -511,7 +826,7 @@ class JevActiveReply(Star):
                 return
         umo = event.unified_msg_origin
         evaluation_kind = (
-            "shadow_evaluations" if self._cfg("dry_run", True) else "evaluations"
+            "shadow_evaluations" if self._cfg("dry_run", False) else "evaluations"
         )
         eval_limit = max(0, int(self._cfg("daily_evaluation_limit", 0)))
         reply_limit = max(0, int(self._cfg("daily_reply_limit", 0)))
@@ -533,6 +848,9 @@ class JevActiveReply(Star):
         try:
             state, cid, history_hash = await asyncio.wait_for(
                 bridge.build_snapshot(self.context, event, room, target, self.config), 3
+            )
+            state["ignored_background"] = self.ignored_background.text(
+                umo, self._silence_settings()
             )
             if room.cid != cid:
                 room.rows.clear()
@@ -559,11 +877,15 @@ class JevActiveReply(Star):
                 <= float(self._cfg("continuation_seconds", 180))
             )
             recent = sum(now - t < 120 for t in room.sent_times)
+            decision_started = time.monotonic()
             if (
                 "Image" in target["actual_media"]
-                and self._cfg("image_decision_mode", "native_vision") == "native_vision"
+                and self._cfg("image_decision_mode", "text_gate") == "native_vision"
             ):
-                if not await self.client.review_ready():
+                if (
+                    self._cfg("second_review", "always") != "adaptive"
+                    and not await self.client.review_ready()
+                ):
                     self._note(event, "visual_review_channel_unavailable")
                     return
                 response = {}
@@ -576,13 +898,18 @@ class JevActiveReply(Star):
                 except DecisionError as exc:
                     self._note(event, exc.code, {"status": exc.status})
                     return
-                verdict = decide(
-                    response["values"],
-                    active,
-                    recent,
-                    self._cfg("style", "balanced"),
-                    self.config,
-                )
+                if self._cfg("decision_mode", "classic") == "natural":
+                    verdict = natural_decide(
+                        response["values"], self._cfg("style", "balanced"), self.config
+                    )
+                else:
+                    verdict = decide(
+                        response["values"],
+                        active,
+                        recent,
+                        self._cfg("style", "balanced"),
+                        self.config,
+                    )
                 values = response["values"]
                 if (
                     not verdict.speak
@@ -595,9 +922,17 @@ class JevActiveReply(Star):
             self._note(
                 event,
                 verdict.reason,
-                {**response, "mode": verdict.mode, "truncated": state["truncated"]},
+                {
+                    **response,
+                    "mode": verdict.mode,
+                    "truncated": state["truncated"],
+                    "stage_ms": round((time.monotonic() - decision_started) * 1000),
+                },
             )
-            if not verdict.speak or self._cfg("dry_run", True):
+            if not verdict.speak or self._cfg("dry_run", False):
+                return
+            if bridge.native_busy(event):
+                self._note(event, "native_reply_in_progress")
                 return
             if (
                 generation != room.generation
@@ -651,7 +986,7 @@ class JevActiveReply(Star):
             self._install_sender(event)
             meta = event.get_extra(MARK)
             meta["lease"] = asyncio.get_running_loop().call_later(
-                min(180, max(15, float(self._cfg("request_lifetime_seconds", 90)))),
+                max(0, self._lifetime() - (time.monotonic() - meta["created"])),
                 self._expire,
                 event,
             )
@@ -697,7 +1032,10 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             return
-        if self._blocked(event) or time.monotonic() - meta["created"] > 90:
+        if (
+            self._blocked(event)
+            or time.monotonic() - meta["created"] > self._lifetime()
+        ):
             self._reject(event, None, "cancelled_before_generation")
             return
         if meta["cid"] and str(getattr(req.conversation, "cid", "")) != meta["cid"]:
@@ -767,7 +1105,7 @@ class JevActiveReply(Star):
             ]["effective_system_prompt"].replace(
                 persona, "[Same persona as bot_persona; preserved there verbatim]", 1
             )
-        if self._cfg("second_review", "always") != "off":
+        if self._cfg("second_review", "always") not in ("off", "adaptive"):
             try:
                 fit_state(
                     {
@@ -781,9 +1119,8 @@ class JevActiveReply(Star):
                 if self._cfg("overflow_evidence_policy", "summarize") != "summarize":
                     self._reject(event, None, "generation_evidence_over_budget")
                     return
-                if not await self._summarize_overflow(event, meta):
-                    self._reject(event, None, "overflow_summary_unavailable")
-                    return
+                meta["evidence_overflow"] = True
+                self._note(event, "auxiliary_summary_deferred_until_draft")
         # Read-only tools retain perception; unsolicited side effects are not licensed.
         tools = getattr(req, "func_tool", None)
         if tools is not None:
@@ -863,6 +1200,9 @@ class JevActiveReply(Star):
             self._note(event, "auxiliary_evidence_summarized_on_overflow")
             return True
         except asyncio.CancelledError:
+            if meta.get("rejected") or self.closed:
+                self._note(event, "superseded_summary_cancelled")
+                return False
             raise
         except Exception:
             return False
@@ -881,6 +1221,9 @@ class JevActiveReply(Star):
 
     @filter.on_llm_response(priority=80)
     async def on_response(self, event: AstrMessageEvent, response):
+        if event.get_extra(silence.SILENT):
+            silence.clear_output(event, response)
+            return
         task = asyncio.current_task()
         self.tasks.add(task)
         try:
@@ -893,7 +1236,7 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             if (
-                self._enabled(event)
+                self._in_scope(event)
                 and text
                 and not is_refusal(text)
                 and not self._blocked(event)
@@ -919,6 +1262,19 @@ class JevActiveReply(Star):
         meta["response"] = response
         review = self._cfg("second_review", "always")
         changed = room is None or room.generation != meta["generation"]
+        if review == "adaptive":
+            if len(text) > max(
+                200, min(20000, int(self._cfg("max_autonomous_reply_chars", 2000)))
+            ):
+                self._reject(event, response, "draft_too_long")
+                return
+            if not force and not changed:
+                meta["reviewed"] = True
+                meta["approved_generation"] = room.generation
+                self._note(event, "adaptive_direct")
+                return
+            await self._check_draft_freshness(event, response, meta, room)
+            return
         if (
             not force
             and not changed
@@ -943,6 +1299,12 @@ class JevActiveReply(Star):
         try:
             if room is None:
                 raise DecisionError("room_unavailable")
+            if meta.get("evidence_overflow"):
+                if not await self._summarize_overflow(event, meta):
+                    if not meta.get("rejected") and not self.closed:
+                        self._reject(event, response, "overflow_summary_unavailable")
+                    return
+                meta["evidence_overflow"] = False
             generation = room.generation
             state, cid, _ = await asyncio.wait_for(
                 bridge.build_snapshot(
@@ -953,6 +1315,9 @@ class JevActiveReply(Star):
             if meta["cid"] and cid != meta["cid"]:
                 raise DecisionError("conversation_changed")
             state["candidate_reply"] = text
+            state["ignored_background"] = self.ignored_background.text(
+                event.unified_msg_origin, self._silence_settings()
+            )
             state["generation_evidence"] = meta.get("generation_evidence", {})
             state["perception"] = {
                 "main_model_received_images": meta.get("visual_access", False),
@@ -986,8 +1351,55 @@ class JevActiveReply(Star):
         except Exception:
             self._reject(event, response, "review_unavailable")
 
+    async def _check_draft_freshness(self, event, response, meta, room):
+        """One bounded freshness check, never a summary or another full review."""
+        if room is None:
+            self._reject(event, response, "room_unavailable")
+            return
+        generation = room.generation
+        try:
+            state, cid, _ = await asyncio.wait_for(
+                bridge.build_snapshot(
+                    self.context, event, room, self._outline(event), self.config
+                ),
+                3,
+            )
+            if meta["cid"] and cid != meta["cid"]:
+                self._reject(event, response, "conversation_changed")
+                return
+            state["candidate_reply"] = meta["draft"]
+            state["perception"] = {
+                "main_model_received_images": meta.get("visual_access", False),
+                "reviewer_received_images": False,
+            }
+            result = await self.client.evaluate(
+                state, questions_for(self.config, freshness=True)
+            )
+            self._note(event, "freshness_result", result)
+            cid, _ = await bridge.conversation(self.context, event)
+            if (
+                room.generation != generation
+                or self._blocked(event)
+                or (meta["cid"] and cid != meta["cid"])
+            ):
+                self._reject(event, response, "review_superseded")
+                return
+            if result["values"].get("still_fits", 0) < 0.5:
+                self._reject(event, response, "freshness_veto")
+                return
+            meta["reviewed"] = True
+            meta["approved_generation"] = generation
+        except asyncio.CancelledError:
+            self._reject(event, response, "review_cancelled")
+            raise
+        except Exception:
+            self._reject(event, response, "freshness_unavailable")
+
     @filter.on_decorating_result(priority=100000)
     async def before_output(self, event: AstrMessageEvent):
+        if event.get_extra(silence.SILENT):
+            silence.clear_output(event)
+            return
         meta = event.get_extra(MARK)
         if not meta:
             return
@@ -995,7 +1407,7 @@ class JevActiveReply(Star):
             meta["rejected"]
             or not meta["reviewed"]
             or self._blocked(event)
-            or time.monotonic() - meta["created"] > 90
+            or time.monotonic() - meta["created"] > self._lifetime()
         ):
             self._reject(event, None, "output_cancelled")
             return
@@ -1014,6 +1426,9 @@ class JevActiveReply(Star):
 
     @filter.on_decorating_result(priority=-100000)
     async def after_output_decoration(self, event: AstrMessageEvent):
+        if event.get_extra(silence.SILENT):
+            silence.clear_output(event)
+            return
         meta = event.get_extra(MARK)
         if not meta:
             return
@@ -1029,7 +1444,7 @@ class JevActiveReply(Star):
 
     @filter.after_message_sent(priority=-100000)
     async def after_sent(self, event: AstrMessageEvent):
-        if not self._enabled(event):
+        if not self._in_scope(event):
             return
         room = self.rooms.rooms.get(event.unified_msg_origin)
         if room is None:
@@ -1075,6 +1490,91 @@ class JevActiveReply(Star):
                 }
             )
             event.set_extra(NORMAL, "")
+            room.notify()
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("jev拉黑", alias={"拉黑"})
+    async def ignore_user(self, event: AstrMessageEvent, target: str = ""):
+        if not self._silence_scope(event):
+            yield event.plain_result("当前会话未开启内置沉默与忽略功能。")
+            return
+        uid = self._ignore_target(event, target)
+        if not uid:
+            yield event.plain_result("用法：jev拉黑 @用户 或 用户ID")
+            return
+        cfg = self._silence_settings()
+        admins = {str(x) for x in self.context.get_config().get("admins_id", [])}
+        if (
+            uid == str(event.get_self_id())
+            or (cfg.get("protected_admins", True) and uid in admins)
+            or uid in silence.values(cfg, "must_reply_uid")
+        ):
+            yield event.plain_result("该用户受保护，未加入忽略名单。")
+            return
+        async with self.config_lock:
+            new = sorted(
+                silence.values(self._silence_settings(), "ignored_users") | {uid}
+            )
+            await self._save_ignored(new)
+        yield event.plain_result(f"已忽略 {uid}：不响应其请求，但保留临时话题背景。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("jev取消拉黑", alias={"取消拉黑"})
+    async def unignore_user(self, event: AstrMessageEvent, target: str = ""):
+        if not self._silence_scope(event):
+            yield event.plain_result("当前会话未开启内置沉默与忽略功能。")
+            return
+        uid = self._ignore_target(event, target)
+        if not uid:
+            yield event.plain_result("用法：jev取消拉黑 @用户 或 用户ID")
+            return
+        async with self.config_lock:
+            await self._save_ignored(
+                sorted(
+                    silence.values(self._silence_settings(), "ignored_users") - {uid}
+                )
+            )
+        yield event.plain_result(
+            f"已取消忽略 {uid}。群内定向及会话级规则仍按配置生效。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("jev黑名单", alias={"黑名单"})
+    async def ignored_status(self, event: AstrMessageEvent):
+        cfg = self._silence_settings()
+        yield event.plain_result(
+            "Jev 忽略名单\n"
+            + "\n".join(
+                key + ": " + (", ".join(sorted(silence.values(cfg, key))) or "(空)")
+                for key in ("ignored_users", "ignored_sessions", "ignored_group_users")
+            )
+        )
+
+    @staticmethod
+    def _ignore_target(event, text):
+        for part in event.get_messages():
+            if type(part).__name__ == "At" and str(part.qq) not in (
+                "all",
+                str(event.get_self_id()),
+            ):
+                return str(part.qq)
+        value = str(text).strip()
+        return (
+            value
+            if value and not any(ch.isspace() for ch in value) and len(value) <= 128
+            else ""
+        )
+
+    async def _save_ignored(self, users):
+        previous = self.config.get("silence", {})
+        self.config["silence"] = {**previous, "ignored_users": users}
+        try:
+            save = getattr(self.config, "save_config", None)
+            if callable(save):
+                await asyncio.to_thread(save)
+        except BaseException:
+            self.config["silence"] = previous
+            raise
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("jev恢复")
@@ -1085,24 +1585,86 @@ class JevActiveReply(Star):
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("jev静音")
+    async def quiet_room(self, event: AstrMessageEvent, minutes: int = 10):
+        if (
+            event.is_private_chat()
+            or not self._cfg("enabled", True)
+            or self._cfg("dry_run", False)
+        ):
+            yield event.plain_result("群级静音仅在正式启用的群聊中生效。")
+            return
+        allow = self._cfg("enabled_sessions", [])
+        if not any(
+            x in allow
+            for x in ("*", event.unified_msg_origin, str(event.get_group_id()))
+        ):
+            yield event.plain_result("本群不在插件接管范围内。")
+            return
+        room = self.rooms.get(event.unified_msg_origin)
+        if room is None:
+            yield event.plain_result("会话状态暂不可用，请稍后再试。")
+            return
+        minutes = min(1440, max(1, minutes))
+        async with room.quiet_lock:
+            room.quiet_until = time.monotonic() + minutes * 60
+            room.quiet_loaded = True
+            self._cancel_room_candidates(event, room)
+            await self.ledger.acooldown(
+                "room_quiet:" + scope_id(event.unified_msg_origin),
+                time.time() + minutes * 60,
+            )
+        yield event.plain_result(
+            f"本群暂停接话 {minutes} 分钟，已撤销未发送的自主回复。管理命令和已配置的过滤豁免对象不受影响。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("jev开口")
+    async def resume_room(self, event: AstrMessageEvent):
+        if (
+            event.is_private_chat()
+            or self._cfg("dry_run", False)
+            or not self._cfg("enabled", True)
+        ):
+            yield event.plain_result("请在正式启用的群聊中使用。")
+            return
+        room = self.rooms.get(event.unified_msg_origin)
+        if room is None:
+            return
+        async with room.quiet_lock:
+            await self.ledger.acooldown(
+                "room_quiet:" + scope_id(event.unified_msg_origin), 0
+            )
+            room.quiet_until = 0
+            room.quiet_loaded = True
+            room.quiet_senders.clear()
+            room.notify()
+        yield event.plain_result("本群沉默已解除，恢复按人设和语境判断，不补发旧消息。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("jev状态", alias={"jev诊断"})
     async def status(self, event: AstrMessageEvent):
         if self.audit_task:
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.2.1 · 木有知",
-            f"模式：{'影子观察（不触发）' if self._cfg('dry_run', True) else '主动触发'}",
-            f"当前会话：{'已授权' if self._enabled(event) else '未授权'}",
+            "Jev 主动回复插件 0.8.0 · 木有知",
+            f"当前群：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         for p in pools:
+            name = {"nanbei": "南北绿豆站", "typesafe": "Jev 官方"}[p["channel"]]
             lines.append(
-                f"{p['channel']}：{p['keys']} 个 Key，认证熔断 {p['disabled_keys']} 个，窗口 {p['window_used']}/{p['quota_rpm']}，并发 {p['in_flight']}，冷却 {p['cooldown_seconds']} 秒"
+                f"{name}：{p['keys']} 枚 Key，失效 {p['disabled_keys']} 枚，正在判断 {p['in_flight']} 次"
             )
+            if p["cooldown_seconds"]:
+                lines.append(f"服务暂时退避：{p['cooldown_seconds']} 秒")
         found = bridge.conflicts(self.context, event)
         lines.append("竞争唤醒：" + (", ".join(found) if found else "未检测到"))
         lines.append(
-            f"今日评估尝试 {await self.ledger.acount(event.unified_msg_origin, 'evaluations')}；影子评估 {await self.ledger.acount(event.unified_msg_origin, 'shadow_evaluations')}；主动发送完成 {await self.ledger.acount(event.unified_msg_origin, 'sent')}"
+            f"内置沉默：{'可用' if self._can_keep_silent(event) else '本轮未开放'}；忽略用户 {len(silence.values(self._silence_settings(), 'ignored_users'))} 个"
+        )
+        lines.append(
+            f"本群今日判断 {await self.ledger.acount(event.unified_msg_origin, 'evaluations')} 次，主动回复 {await self.ledger.acount(event.unified_msg_origin, 'sent')} 次"
         )
         lines.append(
             "最近原因："
@@ -1111,11 +1673,11 @@ class JevActiveReply(Star):
             )
         )
         lines.append(
-            f"上下文：{self._cfg('context_mode', 'quality')}；二审：{self._cfg('second_review', 'always')}；同人补充窗口：{self._cfg('burst_window_seconds', 5)} 秒"
+            f"判断：{self._cfg('decision_mode', 'classic')}；复查：{self._cfg('second_review', 'always')}；同人补充窗口：{self._cfg('burst_window_seconds', 5)} 秒"
         )
         if not await self.client.review_ready():
             lines.append(
-                "Jev 当前无可用渠道，不接管 WakePro 的唤醒。补足额度/调整 Key 后可使用 jev恢复 清除暂时冷却。"
+                "Jev 暂不可用，请检查所选渠道的 Key 和账户余额。主动接话暂停，正常 @ 和昵称呼叫不受影响；临时故障解除后可发送 jev恢复。"
             )
         lines.append("本命令不请求上游，不展示 Key 或聊天正文。")
         yield event.plain_result("\n".join(lines))
@@ -1137,5 +1699,5 @@ class JevActiveReply(Star):
         if self.audit_task:
             await asyncio.gather(self.audit_task, return_exceptions=True)
         self.split_adapters.restore()
-        self.wake_adapters.restore()
+        self.ignored_background.clear()
         await self.ledger.aclose()

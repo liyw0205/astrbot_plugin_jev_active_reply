@@ -42,12 +42,12 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 "primary_channel": "typesafe",
                 "allow_channel_fallback": True,
                 "typesafe": {"keys": ["official-a", "official-b"], "quota_rpm": 2},
-                "mindshub": {"keys": ["hub-a", "hub-b"]},
+                "nanbei": {"keys": ["hub-a", "hub-b"]},
             }
         )
         # Test-only injection; production configuration rejects plain HTTP.
         for name, pool in self.client.pools.items():
-            suffix = "/v1/systemone" if name == "typesafe" else "/v1/decisions"
+            suffix = "/v1/systemone"
             pool.adapter = replace(
                 pool.adapter, endpoint=f"http://127.0.0.1:{self.port}{suffix}"
             )
@@ -60,9 +60,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(4):
             result = await self.client.evaluate({"text": "中文测试"}, QUESTIONS)
             self.assertEqual(result["model"], "jev-1.13.0")
-        self.assertEqual(
-            [p for p, _, _ in self.calls], ["/v1/systemone"] * 2 + ["/v1/decisions"] * 2
-        )
+        self.assertEqual([p for p, _, _ in self.calls], ["/v1/systemone"] * 4)
         self.assertEqual(
             [k for _, k, _ in self.calls],
             ["Bearer official-a", "Bearer official-b", "Bearer hub-a", "Bearer hub-b"],
