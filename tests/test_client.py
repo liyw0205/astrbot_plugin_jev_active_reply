@@ -90,10 +90,16 @@ class ContractTests(unittest.TestCase):
     def test_endpoints_and_aliases(self):
         a = Adapter.create("typesafe", {})
         b = Adapter.create("nanbei", {})
+        custom = Adapter.create(
+            "custom",
+            {"endpoint": "https://jev.example.test/decision", "model": "my-jev"},
+        )
         self.assertTrue(a.endpoint.endswith("/v1/systemone"))
         self.assertTrue(b.endpoint.endswith("/v1/systemone"))
         self.assertEqual(a.model, "jev-latest")
         self.assertEqual(b.model, "jev-latest")
+        self.assertEqual(custom.endpoint, "https://jev.example.test/decision")
+        self.assertEqual(custom.model, "my-jev")
         self.assertEqual(set(a.encode({}, QUESTIONS)), {"model", "state", "questions"})
         self.assertEqual(a.decode(answer(), QUESTIONS), b.decode(answer(), QUESTIONS))
 
@@ -144,6 +150,10 @@ class ContractTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 Adapter.create("typesafe", {"endpoint": endpoint})
+        with self.assertRaisesRegex(ValueError, "custom channel requires"):
+            Adapter.create("custom", {})
+        with self.assertRaises(ValueError):
+            Adapter.create("custom", {"endpoint": "http://jev.example.test/decision"})
 
     def test_retry_header_dates(self):
         self.assertEqual(retry_delay("Fri, 02 Oct 2026 00:00:00 GMT", 1790899190), 10)

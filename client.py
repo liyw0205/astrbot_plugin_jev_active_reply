@@ -20,7 +20,10 @@ from .policy import fit_state
 ENDPOINTS = {
     "typesafe": ("https://api.typesafe.ai/v1/systemone", "jev-latest"),
     "nanbei": ("https://hajimi.165201.xyz/v1/systemone", "jev-latest"),
+    # Custom uses the same native Jev protocol but supplies its own endpoint.
+    "custom": ("", "jev-latest"),
 }
+BUILTIN_CHANNELS = ("typesafe", "nanbei")
 
 
 class DecisionError(Exception):
@@ -57,6 +60,8 @@ class Adapter:
             raise ValueError("unknown channel type")
         endpoint, model = ENDPOINTS[kind]
         endpoint = str(config.get("endpoint") or endpoint).strip()
+        if kind == "custom" and not endpoint:
+            raise ValueError("custom channel requires an endpoint")
         parsed = urlsplit(endpoint)
         if (
             parsed.scheme != "https"
@@ -67,12 +72,18 @@ class Adapter:
             or parsed.fragment
         ):
             raise ValueError("endpoint must be an HTTPS URL without credentials/query")
-        if parsed.path.rstrip("/") != urlsplit(ENDPOINTS[kind][0]).path:
+        if (
+            kind != "custom"
+            and parsed.path.rstrip("/") != urlsplit(ENDPOINTS[kind][0]).path
+        ):
             raise ValueError("endpoint path does not match the selected adapter")
-        return cls(kind, endpoint, str(config.get("model") or model).strip())
+        model = str(config.get("model") or model).strip()
+        if not model:
+            raise ValueError("model must not be empty")
+        return cls(kind, endpoint, model)
 
     def encode(self, state: dict, questions: dict) -> dict:
-        # Both contracts currently share typed primitives, but not URL/aliases/errors.
+        # Every supported adapter uses the native Jev typed-request contract.
         return {"model": self.model, "state": state, "questions": questions}
 
     def decode(self, body: object, questions: dict) -> dict:
@@ -275,7 +286,15 @@ class JevClient:
             raise ValueError("invalid primary_channel")
         self.order = [primary]
         if config.get("allow_channel_fallback", False):
-            self.order += [k for k in ENDPOINTS if k != primary]
+            self.order += [k for k in BUILTIN_CHANNELS if k != primary]
+            custom = config.get("custom", {})
+            if (
+                primary != "custom"
+                and isinstance(custom, dict)
+                and custom.get("endpoint")
+                and custom.get("keys")
+            ):
+                self.order.append("custom")
         self.pools = {}
         for kind in self.order:
             cfg = config.get(kind, {})

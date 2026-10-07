@@ -17,13 +17,15 @@
     "default": "nanbei",
     "options": [
       "nanbei",
-      "typesafe"
+      "typesafe",
+      "custom"
     ],
     "description": "Jev 服务",
     "invisible": false,
     "labels": [
       "南北绿豆站（推荐）",
-      "Jev 官方"
+      "Jev 官方",
+      "自定义服务"
     ]
   },
   "nanbei": {
@@ -144,6 +146,68 @@
     "invisible": false,
     "condition": {
       "primary_channel": "typesafe"
+    }
+  },
+  "custom": {
+    "type": "object",
+    "description": "自定义 Jev 服务",
+    "items": {
+      "keys": {
+        "type": "list",
+        "default": [],
+        "description": "API Key",
+        "hint": "填写自定义服务的 Bearer Key；支持多枚，按填写顺序轮询。",
+        "invisible": false
+      },
+      "quota_group_ids": {
+        "type": "list",
+        "default": [],
+        "description": "Key 对应的账户配额组，可留空",
+        "hint": "留空表示所有 Key 共用同一账户额度。填写时须与 Keys 一一对应。",
+        "invisible": true
+      },
+      "endpoint": {
+        "type": "string",
+        "default": "",
+        "description": "自定义 Jev 原生接口地址",
+        "hint": "必须是 HTTPS 地址，直接接收 Jev 原生请求（model、state、questions）。",
+        "invisible": false
+      },
+      "model": {
+        "type": "string",
+        "default": "jev-latest",
+        "description": "模型名称",
+        "hint": "按自定义服务要求填写，默认 jev-latest。",
+        "invisible": false
+      },
+      "quota_rpm": {
+        "type": "int",
+        "default": 0,
+        "description": "兼容旧配置（默认不限制）",
+        "invisible": true
+      },
+      "key_rpm": {
+        "type": "int",
+        "default": 0,
+        "description": "兼容旧配置（默认不限制）",
+        "invisible": true
+      },
+      "concurrency": {
+        "type": "int",
+        "default": 8,
+        "description": "池并发上限，每枚 Key 最多一个在途请求",
+        "invisible": true
+      },
+      "daily_request_limit": {
+        "type": "int",
+        "default": 0,
+        "description": "兼容旧配置（默认不限制）",
+        "invisible": true
+      }
+    },
+    "invisible": false,
+    "condition": {
+      "primary_channel": "custom"
     }
   },
   "style": {

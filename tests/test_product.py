@@ -11,22 +11,28 @@ from ..client import JevClient, KeyPool
 from ..settings import ConfigView
 
 
-@pytest.mark.parametrize("kind", ["nanbei", "typesafe"])
+@pytest.mark.parametrize("kind", ["nanbei", "typesafe", "custom"])
 def test_dashboard_only_selected_channel_needs_configuration(kind):
     schema = json.loads(
         (Path(__file__).parents[1] / "_conf_schema.json").read_text(encoding="utf-8")
     )
     visible = [
         name
-        for name in ("nanbei", "typesafe")
+        for name in ("nanbei", "typesafe", "custom")
         if schema[name]["condition"] == {"primary_channel": kind}
     ]
     assert visible == [kind]
     fields = schema[kind]["items"]
-    assert [name for name, field in fields.items() if not field.get("invisible")] == [
-        "keys"
+    expected_visible = ["keys"] if kind != "custom" else ["keys", "endpoint", "model"]
+    visible_fields = [
+        name for name, field in fields.items() if not field.get("invisible")
     ]
-    assert schema["primary_channel"]["labels"] == ["南北绿豆站（推荐）", "Jev 官方"]
+    assert visible_fields == expected_visible
+    assert schema["primary_channel"]["labels"] == [
+        "南北绿豆站（推荐）",
+        "Jev 官方",
+        "自定义服务",
+    ]
     assert schema["dry_run"]["invisible"] and schema["dry_run"]["default"] is False
 
 
@@ -49,6 +55,11 @@ def test_legacy_migration_removes_caps_and_preserves_conversation_settings():
             "quota_rpm": 55,
             "daily_request_limit": 500,
         },
+        "custom": {
+            "keys": ["custom_test_only"],
+            "quota_rpm": 55,
+            "daily_request_limit": 500,
+        },
         "silence": {"ignored_users": ["example"]},
         "advanced": {
             "network": {"daily_evaluation_limit": 50, "allow_channel_fallback": True},
@@ -68,7 +79,7 @@ def test_legacy_migration_removes_caps_and_preserves_conversation_settings():
     assert config["second_review"] == "always"
     assert not config["dry_run"] and not config["allow_channel_fallback"]
     assert config["daily_evaluation_limit"] == config["daily_reply_limit"] == 0
-    for kind in ("nanbei", "typesafe"):
+    for kind in ("nanbei", "typesafe", "custom"):
         assert config[kind]["keys"] == before[kind]["keys"]
         assert (
             config[kind]["quota_rpm"]
@@ -147,3 +158,36 @@ async def test_only_selected_channel_is_called_after_switch(kind, secret):
         assert ("hajimi.165201.xyz" in calls[0][0]) == (kind == "nanbei")
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_custom_channel_uses_its_endpoint_and_model():
+    calls = []
+
+    async def transport(endpoint, key, payload):
+        calls.append((endpoint, key, payload["model"]))
+        return 200, {}, {"answers": {"ok": {"type": "noul", "noul": 0.8}}}
+
+    client = JevClient(
+        ConfigView(
+            {
+                "primary_channel": "custom",
+                "custom": {
+                    "endpoint": "https://jev.example.test/decision",
+                    "model": "custom-model",
+                    "keys": ["custom-key"],
+                },
+            }
+        ),
+        transport=transport,
+    )
+    try:
+        await client.evaluate(
+            {"text": "example"},
+            {"ok": {"type": "noul", "instructions": "Is it appropriate?"}},
+        )
+    finally:
+        await client.close()
+    assert calls == [
+        ("https://jev.example.test/decision", "custom-key", "custom-model")
+    ]

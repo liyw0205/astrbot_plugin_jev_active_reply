@@ -115,7 +115,7 @@ class ConfigView(MutableMapping):
                     daily_evaluation_limit=0,
                     daily_reply_limit=0,
                 )
-            for kind in ("nanbei", "typesafe"):
+            for kind in ("nanbei", "typesafe", "custom"):
                 channel = raw.get(kind)
                 if isinstance(channel, dict):
                     channel.update(

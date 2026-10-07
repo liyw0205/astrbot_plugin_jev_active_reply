@@ -535,7 +535,7 @@ class JevActiveReply(Star):
 
     async def initialize(self):
         logger.info(
-            "[JevActive] loaded in %s mode; both channel pools ready; no startup API probe",
+            "[JevActive] loaded in %s mode; configured channel pools ready; no startup API probe",
             "shadow" if self._cfg("dry_run", False) else "live",
         )
 
@@ -1652,7 +1652,11 @@ class JevActiveReply(Star):
             f"当前群：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         for p in pools:
-            name = {"nanbei": "南北绿豆站", "typesafe": "Jev 官方"}[p["channel"]]
+            name = {
+                "nanbei": "南北绿豆站",
+                "typesafe": "Jev 官方",
+                "custom": "自定义服务",
+            }.get(p["channel"], p["channel"])
             lines.append(
                 f"{name}：{p['keys']} 枚 Key，失效 {p['disabled_keys']} 枚，正在判断 {p['in_flight']} 次"
             )
